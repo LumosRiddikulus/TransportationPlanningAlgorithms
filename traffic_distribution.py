@@ -1,11 +1,14 @@
 import json
 import math
 import heapq
+from typing import List, Dict, Tuple, Callable
+from collections import defaultdict
 import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
-from typing import List, Dict, Tuple, Callable
-from collections import defaultdict
+from matplotlib.patches import FancyBboxPatch
+import matplotlib.patches as mpatches
+
 
 class Graph:
     """简单的图类"""
@@ -206,6 +209,8 @@ class RoadNetwork:
                 
                 self.add_link(f"{from_node}{to_node}", from_node, to_node, 
                              length, capacity, speed_max)
+                self.add_link(f"{to_node}{from_node}", to_node, from_node, 
+                             length, capacity, speed_max)
             
             print(f"成功加载路网: {len(self.nodes)}个节点, {len(self.links)}条路段")
             
@@ -224,7 +229,8 @@ class RoadNetwork:
                 self.demands.append({
                     'from': data['from'][i],
                     'to': data['to'][i],
-                    'amount': data['amount'][i]
+                    'amount': data['amount'][i],
+                    'id': i+1  # 添加OD对编号
                 })
             
             print(f"成功加载交通需求: {len(self.demands)}个OD对")
@@ -318,8 +324,69 @@ class RoadNetwork:
         dfs(start, [start])
         return paths
     
+    # ========== 全有全无分配算法 ==========
+    
+    def all_or_nothing_single_od(self, origin: str, destination: str, amount: float) -> Dict:
+        """单个OD对的全有全无分配"""
+        # 临时保存当前流量
+        temp_flows = {link_id: link['flow'] for link_id, link in self.links.items()}
+        
+        # 重置为0
+        for link_id in self.links:
+            self.links[link_id]['flow'] = 0
+        
+        self.update_graph_weights("free_flow")
+        
+        used_paths = {}
+        
+        shortest_path = self.graph.dijkstra(origin, destination)
+        
+        if not shortest_path:
+            print(f"警告: 找不到从 {origin} 到 {destination} 的路径")
+            # 恢复流量
+            for link_id, flow in temp_flows.items():
+                self.links[link_id]['flow'] = flow
+            return {'used_paths': {}, 'link_flows': {}}
+        
+        path_key = "->".join(shortest_path)
+        used_paths[path_key] = {
+            'path': shortest_path,
+            'flow': amount,
+            'travel_time': 0
+        }
+        
+        for i in range(len(shortest_path)-1):
+            from_node = shortest_path[i]
+            to_node = shortest_path[i+1]
+            link_id = f"{from_node}{to_node}"
+            self.links[link_id]['flow'] = amount
+        
+        # 计算路径行程时间
+        path_travel_time = 0
+        for i in range(len(shortest_path)-1):
+            from_node = shortest_path[i]
+            to_node = shortest_path[i+1]
+            link_id = f"{from_node}{to_node}"
+            path_travel_time += self.calculate_travel_time(link_id, self.links[link_id]['flow'])
+        used_paths[path_key]['travel_time'] = path_travel_time
+        
+        # 记录单OD分配的路段流量
+        link_flows = {}
+        for link_id in self.links:
+            if self.links[link_id]['flow'] > 0:
+                link_flows[link_id] = self.links[link_id]['flow']
+        
+        # 恢复整体流量
+        for link_id, flow in temp_flows.items():
+            self.links[link_id]['flow'] = flow
+        
+        return {
+            'used_paths': used_paths,
+            'link_flows': link_flows
+        }
+    
     def all_or_nothing_assignment(self) -> Dict:
-        """全有全无分配算法"""
+        """全有全无分配算法（整体）"""
         self.reset_flows()
         self.update_graph_weights("free_flow")
         
@@ -374,8 +441,74 @@ class RoadNetwork:
             'used_paths': used_paths
         }
     
+    # ========== 增量分配算法 ==========
+    
+    def incremental_single_od(self, origin: str, destination: str, amount: float, increments: int = 4) -> Dict:
+        """单个OD对的增量分配"""
+        # 临时保存当前流量
+        temp_flows = {link_id: link['flow'] for link_id, link in self.links.items()}
+        
+        # 重置为0
+        for link_id in self.links:
+            self.links[link_id]['flow'] = 0
+        
+        used_paths = {}
+        
+        for step in range(increments):
+            fraction = 1.0 / increments
+            step_amount = amount * fraction
+            
+            self.update_graph_weights("current")
+            
+            shortest_path = self.graph.dijkstra(origin, destination)
+            
+            if not shortest_path:
+                continue
+            
+            path_key = "->".join(shortest_path)
+            
+            if path_key not in used_paths:
+                used_paths[path_key] = {
+                    'path': shortest_path,
+                    'flow': 0,
+                    'travel_time': 0
+                }
+            used_paths[path_key]['flow'] += step_amount
+            
+            for i in range(len(shortest_path)-1):
+                from_node = shortest_path[i]
+                to_node = shortest_path[i+1]
+                link_id = f"{from_node}{to_node}"
+                self.links[link_id]['flow'] += step_amount
+        
+        # 计算路径行程时间
+        for path_key, path_info in used_paths.items():
+            path = path_info['path']
+            path_travel_time = 0
+            for i in range(len(path)-1):
+                from_node = path[i]
+                to_node = path[i+1]
+                link_id = f"{from_node}{to_node}"
+                path_travel_time += self.calculate_travel_time(link_id, self.links[link_id]['flow'])
+            used_paths[path_key]['travel_time'] = path_travel_time
+        
+        # 记录单OD分配的路段流量
+        link_flows = {}
+        for link_id in self.links:
+            if self.links[link_id]['flow'] > 0:
+                link_flows[link_id] = self.links[link_id]['flow']
+        
+        # 恢复整体流量
+        for link_id, flow in temp_flows.items():
+            self.links[link_id]['flow'] = flow
+        
+        return {
+            'used_paths': used_paths,
+            'link_flows': link_flows
+        }
+    
     def incremental_assignment(self, increments: int = 4) -> Dict:
-        """增量分配算法"""
+        """增量分配算法（整体）"""
         self.reset_flows()
         
         total_travel_time = 0
@@ -433,6 +566,142 @@ class RoadNetwork:
             'used_paths': used_paths
         }
     
+    # ========== Frank-Wolfe用户均衡分配算法 ==========
+    
+    def frank_wolfe_single_od(self, origin: str, destination: str, amount: float, 
+                            max_iterations: int = 50, tolerance: float = 1e-4) -> Dict:
+        """单个OD对的Frank-Wolfe用户均衡分配"""
+        # 临时保存当前流量
+        temp_flows = {link_id: link['flow'] for link_id, link in self.links.items()}
+        
+        # 重置为0
+        for link_id in self.links:
+            self.links[link_id]['flow'] = 0
+        
+        # 初始化流量
+        x = {link_id: 0.0 for link_id in self.links}
+        
+        # 简单的Frank-Wolfe迭代（针对单个OD对）
+        for iteration in range(max_iterations):
+            # 使用当前流量更新图权重
+            for link_id, flow in x.items():
+                travel_time = self.calculate_travel_time(link_id, flow)
+                from_node = self.links[link_id]['from']
+                to_node = self.links[link_id]['to']
+                self.graph.adjacency[from_node][to_node] = travel_time
+            
+            # 计算辅助流量模式y（全有全无分配）
+            y = {link_id: 0.0 for link_id in self.links}
+            
+            shortest_path = self.graph.dijkstra(origin, destination)
+            if shortest_path:
+                for i in range(len(shortest_path)-1):
+                    from_node = shortest_path[i]
+                    to_node = shortest_path[i+1]
+                    link_id = f"{from_node}{to_node}"
+                    y[link_id] = amount
+            
+            # 计算对偶间隙
+            gap = 0
+            total_travel_time_x = 0
+            
+            for link_id in self.links:
+                travel_time = self.calculate_travel_time(link_id, x[link_id])
+                gap += travel_time * (y[link_id] - x[link_id])
+                total_travel_time_x += travel_time * x[link_id]
+            
+            # 相对对偶间隙
+            if total_travel_time_x > 0:
+                relative_gap = abs(gap) / total_travel_time_x
+            else:
+                relative_gap = float('inf')
+            
+            # 收敛检查
+            if iteration >= 5 and relative_gap < tolerance:
+                break
+            
+            # 使用简单步长
+            alpha = 1.0 / (iteration + 2)
+            
+            # 更新流量
+            for link_id in self.links:
+                x[link_id] = (1 - alpha) * x[link_id] + alpha * y[link_id]
+        
+        # 将流量应用到网络
+        for link_id in self.links:
+            self.links[link_id]['flow'] = x[link_id]
+        
+        # 查找使用的路径
+        used_paths = {}
+        all_paths = self.find_all_paths(origin, destination, max_paths=10)
+        
+        if all_paths:
+            # 计算每条路径的行程时间
+            path_data = []
+            for path in all_paths:
+                path_travel_time = 0
+                for i in range(len(path)-1):
+                    from_node = path[i]
+                    to_node = path[i+1]
+                    link_id = f"{from_node}{to_node}"
+                    path_travel_time += self.calculate_travel_time(link_id, self.links[link_id]['flow'])
+                
+                path_data.append({
+                    'path': path,
+                    'travel_time': path_travel_time,
+                    'key': "->".join(path)
+                })
+            
+            # 找到最短路径时间
+            min_travel_time = min(p['travel_time'] for p in path_data)
+            
+            # 选择行程时间接近最短路径的路径
+            used_paths_for_od = []
+            for path_info in path_data:
+                if abs(path_info['travel_time'] - min_travel_time) < 0.1:  # 0.1小时容差
+                    used_paths_for_od.append(path_info)
+            
+            # 如果找到多条路径，按行程时间分配流量
+            if used_paths_for_od:
+                # 计算权重（行程时间越短，权重越大）
+                total_weight = 0
+                for path_info in used_paths_for_od:
+                    weight = math.exp(-path_info['travel_time'])
+                    path_info['weight'] = weight
+                    total_weight += weight
+                
+                # 按权重分配流量
+                for path_info in used_paths_for_od:
+                    path_flow = amount * (path_info['weight'] / total_weight)
+                    used_paths[path_info['key']] = {
+                        'path': path_info['path'],
+                        'flow': path_flow,
+                        'travel_time': path_info['travel_time']
+                    }
+            else:
+                # 如果没有找到多条路径，使用最短路径
+                shortest_path_info = min(path_data, key=lambda x: x['travel_time'])
+                used_paths[shortest_path_info['key']] = {
+                    'path': shortest_path_info['path'],
+                    'flow': amount,
+                    'travel_time': shortest_path_info['travel_time']
+                }
+        
+        # 记录单OD分配的路段流量
+        link_flows = {}
+        for link_id in self.links:
+            if self.links[link_id]['flow'] > 0:
+                link_flows[link_id] = self.links[link_id]['flow']
+        
+        # 恢复整体流量
+        for link_id, flow in temp_flows.items():
+            self.links[link_id]['flow'] = flow
+        
+        return {
+            'used_paths': used_paths,
+            'link_flows': link_flows
+        }
+    
     def golden_section_search(self, obj_func: Callable[[float], float], 
                             bounds: Tuple[float, float] = (0, 1), 
                             tol: float = 1e-4, max_iter: int = 20) -> float:
@@ -467,7 +736,7 @@ class RoadNetwork:
         return (a + b) / 2
     
     def frank_wolfe_equilibrium(self, max_iterations: int = 100, tolerance: float = 1e-4) -> Dict:
-        """改进的Frank-Wolfe用户均衡分配算法"""
+        """改进的Frank-Wolfe用户均衡分配算法（整体）"""
         print("执行Frank-Wolfe用户均衡分配...")
         
         # 重置流量
@@ -716,198 +985,6 @@ class RoadNetwork:
         
         return used_paths
     
-    def visualize_network(self, results: Dict, algorithm_name: str, save_path: str = None):
-        """可视化路网和分配结果"""
-        plt.figure(figsize=(14, 10))
-        
-        # 创建networkx图
-        G = nx.DiGraph()
-        
-        # 添加节点
-        for node_id, node_info in self.nodes.items():
-            G.add_node(node_id, pos=(node_info['x'], node_info['y']))
-        
-        # 添加边并设置属性
-        edge_flows = []
-        edge_times = []
-        edge_widths = []
-        edge_colors = []
-        
-        for link_id, link in self.links.items():
-            flow = link['flow']
-            travel_time = self.calculate_travel_time(link_id, flow)
-            saturation = flow / link['capacity'] if link['capacity'] > 0 else 0
-            
-            G.add_edge(link['from'], link['to'], 
-                      flow=flow, 
-                      travel_time=travel_time,
-                      saturation=saturation)
-            
-            edge_flows.append(flow)
-            edge_times.append(travel_time)
-            edge_colors.append(saturation)
-            # 线宽基于流量
-            edge_widths.append(1 + 3 * saturation)
-        
-        # 获取节点位置
-        pos = nx.get_node_attributes(G, 'pos')
-        
-        # 绘制边 - 颜色表示饱和度
-        edges = nx.draw_networkx_edges(G, pos, 
-                                      edge_color=edge_colors,
-                                      edge_cmap=plt.cm.Reds,
-                                      edge_vmin=0,
-                                      edge_vmax=1,
-                                      width=edge_widths,
-                                      arrows=True,
-                                      arrowsize=20,
-                                      connectionstyle="arc3,rad=0.1")
-        
-        # 修复颜色条问题：创建一个ScalarMappable对象
-        sm = plt.cm.ScalarMappable(cmap=plt.cm.Reds, norm=plt.Normalize(vmin=0, vmax=1))
-        sm.set_array(edge_colors)
-        
-        # 添加颜色条
-        cb = plt.colorbar(sm, label='路段饱和度', shrink=0.8)
-        
-        # 绘制节点
-        nx.draw_networkx_nodes(G, pos, node_size=500, node_color='lightblue', alpha=0.9)
-        
-        # 添加节点标签
-        nx.draw_networkx_labels(G, pos, font_size=12, font_weight='bold')
-        
-        # 添加边标签（流量和行程时间）
-        edge_labels = {}
-        for u, v, data in G.edges(data=True):
-            edge_labels[(u, v)] = f"{data['flow']:.0f}\n{data['travel_time']:.2f}h"
-        
-        nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=8)
-        
-        # 设置标题和说明
-        plt.title(f"{algorithm_name} - 路网流量分配可视化\n"
-                 f"总出行时间: {results['total_travel_time']:.2f} 车辆-小时", 
-                 fontsize=14, fontweight='bold')
-        
-        # 添加图例说明
-        plt.figtext(0.02, 0.02, 
-                   "说明:\n"
-                   "• 线宽表示流量大小\n"
-                   "• 颜色深浅表示饱和度(红=高饱和度)\n"
-                   "• 边标签: 流量(辆/小时)\\n行程时间(小时)", 
-                   fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
-        
-        plt.axis('off')
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"可视化结果已保存至: {save_path}")
-        
-        plt.show()
-    
-    def plot_convergence(self, convergence_history: List[Dict], algorithm_name: str, save_path: str = None):
-        """绘制算法收敛过程"""
-        if not convergence_history:
-            print("无收敛历史数据可绘制")
-            return
-        
-        iterations = [item['iteration'] for item in convergence_history]
-        gaps = [item['relative_gap'] for item in convergence_history]
-        objectives = [item['objective'] for item in convergence_history]
-        travel_times = [item['travel_time'] for item in convergence_history]
-        
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-        
-        # 绘制相对对偶间隙
-        ax1.semilogy(iterations, gaps, 'b-o', linewidth=2, markersize=6)
-        ax1.set_xlabel('迭代次数')
-        ax1.set_ylabel('相对对偶间隙 (对数尺度)')
-        ax1.set_title(f'{algorithm_name} - 相对对偶间隙收敛过程')
-        ax1.grid(True, alpha=0.3)
-        
-        # 绘制目标函数和总出行时间
-        ax2.plot(iterations, objectives, 'r-o', linewidth=2, markersize=6, label='目标函数值')
-        ax2_twin = ax2.twinx()
-        ax2_twin.plot(iterations, travel_times, 'g--s', linewidth=2, markersize=4, label='总出行时间')
-        
-        ax2.set_xlabel('迭代次数')
-        ax2.set_ylabel('目标函数值', color='r')
-        ax2_twin.set_ylabel('总出行时间 (车辆-小时)', color='g')
-        ax2.set_title(f'{algorithm_name} - 目标函数和总出行时间变化')
-        ax2.grid(True, alpha=0.3)
-        
-        # 合并图例
-        lines1, labels1 = ax2.get_legend_handles_labels()
-        lines2, labels2 = ax2_twin.get_legend_handles_labels()
-        ax2.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
-        
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"收敛图已保存至: {save_path}")
-        
-        plt.show()
-    
-    def plot_flow_comparison(self, aon_flows: Dict, inc_flows: Dict, fw_flows: Dict, save_path: str = None):
-        """绘制三种算法流量对比"""
-        link_ids = sorted(self.links.keys())
-        
-        aon_values = [aon_flows.get(link_id, 0) for link_id in link_ids]
-        inc_values = [inc_flows.get(link_id, 0) for link_id in link_ids]
-        fw_values = [fw_flows.get(link_id, 0) for link_id in link_ids]
-        
-        capacities = [self.links[link_id]['capacity'] for link_id in link_ids]
-        
-        x = np.arange(len(link_ids))
-        width = 0.25
-        
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
-        
-        # 流量对比柱状图
-        ax1.bar(x - width, aon_values, width, label='全有全无分配', alpha=0.8)
-        ax1.bar(x, inc_values, width, label='增量分配', alpha=0.8)
-        ax1.bar(x + width, fw_values, width, label='Frank-Wolfe均衡', alpha=0.8)
-        
-        # 添加容量线
-        ax1.plot(x, capacities, 'r--', linewidth=2, label='路段容量', alpha=0.7)
-        
-        ax1.set_xlabel('路段')
-        ax1.set_ylabel('流量 (辆/小时)')
-        ax1.set_title('三种算法路段流量对比')
-        ax1.set_xticks(x)
-        ax1.set_xticklabels(link_ids, rotation=45)
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-        
-        # 饱和度对比图
-        aon_saturation = [aon_values[i] / capacities[i] if capacities[i] > 0 else 0 for i in range(len(link_ids))]
-        inc_saturation = [inc_values[i] / capacities[i] if capacities[i] > 0 else 0 for i in range(len(link_ids))]
-        fw_saturation = [fw_values[i] / capacities[i] if capacities[i] > 0 else 0 for i in range(len(link_ids))]
-        
-        ax2.bar(x - width, aon_saturation, width, label='全有全无分配', alpha=0.8)
-        ax2.bar(x, inc_saturation, width, label='增量分配', alpha=0.8)
-        ax2.bar(x + width, fw_saturation, width, label='Frank-Wolfe均衡', alpha=0.8)
-        
-        # 添加饱和线
-        ax2.axhline(y=1.0, color='r', linestyle='--', linewidth=2, label='饱和线 (饱和度=1.0)', alpha=0.7)
-        
-        ax2.set_xlabel('路段')
-        ax2.set_ylabel('饱和度')
-        ax2.set_title('三种算法路段饱和度对比')
-        ax2.set_xticks(x)
-        ax2.set_xticklabels(link_ids, rotation=45)
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"流量对比图已保存至: {save_path}")
-        
-        plt.show()
-    
     def print_assignment_results(self, results: Dict, algorithm_name: str):
         """打印分配结果"""
         print(f"\n{'='*60}")
@@ -953,6 +1030,50 @@ class RoadNetwork:
         
         if 'iterations' in results:
             print(f"\n收敛迭代次数: {results['iterations']}")
+    
+    def print_single_od_results(self, algorithm_name: str):
+        """打印所有单OD对分配结果"""
+        print(f"\n{'='*60}")
+        print(f"{algorithm_name} - 单OD对分配结果")
+        print(f"{'='*60}")
+        
+        for demand in self.demands:
+            od_id = demand['id']
+            origin = demand['from']
+            destination = demand['to']
+            amount = demand['amount']
+            
+            print(f"\nOD对 {od_id}: {origin} -> {destination}, 需求: {amount} 辆/小时")
+            
+            # 根据算法名称调用对应的单OD分配函数
+            if algorithm_name == "全有全无分配":
+                result = self.all_or_nothing_single_od(origin, destination, amount)
+            elif algorithm_name == "增量分配":
+                result = self.incremental_single_od(origin, destination, amount, increments=4)
+            elif algorithm_name == "Frank-Wolfe用户均衡分配":
+                result = self.frank_wolfe_single_od(origin, destination, amount, max_iterations=20, tolerance=1e-3)
+            else:
+                print(f"  未知算法: {algorithm_name}")
+                continue
+            
+            # 打印路径信息
+            if 'used_paths' in result and result['used_paths']:
+                print(f"  使用的路径:")
+                for i, (path_key, path_info) in enumerate(result['used_paths'].items(), 1):
+                    print(f"    路径 {i}: {path_key}")
+                    print(f"      流量: {path_info['flow']:.0f} 辆/小时, 行程时间: {path_info['travel_time']:.2f} 小时")
+            else:
+                print(f"  没有找到可行路径")
+            
+            # 打印路段流量
+            if 'link_flows' in result and result['link_flows']:
+                print(f"  路段流量分配:")
+                for link_id, flow in sorted(result['link_flows'].items()):
+                    print(f"    {link_id}: {flow:.0f} 辆/小时")
+            else:
+                print(f"  无路段流量")
+            
+            print("-" * 40)
     
     def text_visualization(self):
         """文本方式可视化路网"""
@@ -1015,61 +1136,529 @@ class RoadNetwork:
             else:
                 print("ℹ️ Frank-Wolfe与增量分配结果相近")
 
+    
+# ========== 新增的图表展示功能 ==========
+    
+    def visualize_network_structure(self, save_path: str = "./outputs/network_structure.png"):
+        """可视化路网结构"""
+        plt.figure(figsize=(12, 10))
+        
+        # 创建NetworkX图
+        G = nx.DiGraph()
+        
+        # 添加节点
+        for node_id, node in self.nodes.items():
+            G.add_node(node_id, pos=(node['x'], node['y']))
+        
+        # 添加边
+        for link_id, link in self.links.items():
+            if link['flow'] == 0:  # 只显示有流量的边
+                continue
+            G.add_edge(link['from'], link['to'], 
+                      weight=link['length'],
+                      capacity=link['capacity'],
+                      flow=link['flow'])
+        
+        # 获取位置
+        pos = nx.get_node_attributes(G, 'pos')
+        
+        # 绘制节点
+        nx.draw_networkx_nodes(G, pos, node_size=800, node_color='lightblue', 
+                              edgecolors='black', linewidths=2)
+        
+        # 绘制节点标签
+        nx.draw_networkx_labels(G, pos, font_size=14, font_weight='bold')
+        
+        # 绘制边
+        edge_colors = []
+        edge_widths = []
+        
+        for (u, v, data) in G.edges(data=True):
+            # 根据饱和度决定颜色
+            saturation = data['flow'] / data['capacity'] if data['capacity'] > 0 else 0
+            if saturation < 0.5:
+                edge_colors.append('green')
+            elif saturation < 0.8:
+                edge_colors.append('orange')
+            else:
+                edge_colors.append('red')
+            
+            # 根据流量决定线宽
+            edge_widths.append(2 + 3 * saturation)
+        
+        nx.draw_networkx_edges(G, pos, edge_color=edge_colors, 
+                              width=edge_widths, arrows=True, 
+                              arrowsize=20, arrowstyle='->')
+        
+        # 添加边标签（流量/容量）
+        edge_labels = {}
+        for (u, v, data) in G.edges(data=True):
+            edge_labels[(u, v)] = f"{data['flow']:.0f}/{data['capacity']}"
+        
+        nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=10)
+        
+        # 添加标题和说明
+        plt.title("Road Network Structure with Traffic Flow", fontsize=16, fontweight='bold')
+        plt.xlabel("X Coordinate (km)", fontsize=12)
+        plt.ylabel("Y Coordinate (km)", fontsize=12)
+        
+        # 添加图例
+        legend_elements = [
+            mpatches.Patch(color='green', label='Low saturation (<0.5)'),
+            mpatches.Patch(color='orange', label='Medium saturation (0.5-0.8)'),
+            mpatches.Patch(color='red', label='High saturation (>0.8)')
+        ]
+        plt.legend(handles=legend_elements, loc='upper right')
+        
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        print(f"网络结构图已保存到: {save_path}")
+    
+    def visualize_algorithm_comparison(self, aon_result, inc_result, fw_result, save_path: str = "./outputs/algorithm_comparison.png"):
+        """可视化三种算法的比较结果"""
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        
+        # 算法名称和结果
+        algorithms = ['All-or-Nothing', 'Incremental', 'Frank-Wolfe UE']
+        travel_times = [aon_result['total_travel_time'], 
+                       inc_result['total_travel_time'], 
+                       fw_result['total_travel_time']]
+        
+        # 1. 总出行时间比较柱状图
+        ax1 = axes[0, 0]
+        bars = ax1.bar(algorithms, travel_times, color=['skyblue', 'lightgreen', 'salmon'])
+        ax1.set_title('Total Travel Time Comparison', fontsize=14, fontweight='bold')
+        ax1.set_ylabel('Total Travel Time (veh-hr)', fontsize=12)
+        ax1.grid(axis='y', alpha=0.3)
+        
+        # 在柱子上添加数值
+        for bar, time in zip(bars, travel_times):
+            height = bar.get_height()
+            ax1.text(bar.get_x() + bar.get_width()/2., height + 5,
+                    f'{time:.1f}', ha='center', va='bottom', fontsize=11)
+        
+        # 2. 路段流量对比散点图
+        ax2 = axes[0, 1]
+        
+        # 收集三种算法的路段流量
+        links = sorted(self.links.keys())
+        aon_flows = [self.links[link]['flow'] for link in links]
+        
+        # 保存当前流量并计算其他算法的流量
+        temp_flows = {link_id: link['flow'] for link_id, link in self.links.items()}
+        
+        # 计算增量分配的流量
+        self.reset_flows()
+        inc_result_temp = self.incremental_assignment(increments=4)
+        inc_flows = [self.links[link]['flow'] for link in links]
+        
+        # 计算Frank-Wolfe的流量
+        self.reset_flows()
+        fw_result_temp = self.frank_wolfe_equilibrium(max_iterations=50, tolerance=1e-3)
+        fw_flows = [self.links[link]['flow'] for link in links]
+        
+        # 恢复原始流量
+        for link_id, flow in temp_flows.items():
+            self.links[link_id]['flow'] = flow
+        
+        # 绘制散点图
+        capacities = [self.links[link]['capacity'] for link in links]
+        
+        ax2.scatter(capacities, aon_flows, alpha=0.7, s=100, label='All-or-Nothing', c='skyblue', edgecolors='black')
+        ax2.scatter(capacities, inc_flows, alpha=0.7, s=100, label='Incremental', c='lightgreen', edgecolors='black', marker='s')
+        ax2.scatter(capacities, fw_flows, alpha=0.7, s=100, label='Frank-Wolfe UE', c='salmon', edgecolors='black', marker='^')
+        
+        # 添加容量线
+        max_capacity = max(capacities)
+        max_flow = max(max(aon_flows), max(inc_flows), max(fw_flows))
+        ax2.plot([0, max_capacity*1.1], [0, max_capacity*1.1], 'r--', alpha=0.5, label='Capacity limit')
+        
+        ax2.set_title('Link Flow vs Capacity', fontsize=14, fontweight='bold')
+        ax2.set_xlabel('Capacity (veh/hr)', fontsize=12)
+        ax2.set_ylabel('Assigned Flow (veh/hr)', fontsize=12)
+        ax2.legend()
+        ax2.grid(alpha=0.3)
+        
+        # 3. 饱和度分布箱线图
+        ax3 = axes[1, 0]
+        
+        # 计算饱和度
+        aon_saturations = [flow/cap if cap > 0 else 0 for flow, cap in zip(aon_flows, capacities)]
+        inc_saturations = [flow/cap if cap > 0 else 0 for flow, cap in zip(inc_flows, capacities)]
+        fw_saturations = [flow/cap if cap > 0 else 0 for flow, cap in zip(fw_flows, capacities)]
+        
+        data = [aon_saturations, inc_saturations, fw_saturations]
+        
+        bp = ax3.boxplot(data, labels=algorithms, patch_artist=True)
+        
+        # 设置箱线图颜色
+        colors = ['skyblue', 'lightgreen', 'salmon']
+        for patch, color in zip(bp['boxes'], colors):
+            patch.set_facecolor(color)
+        
+        ax3.set_title('Saturation Distribution by Algorithm', fontsize=14, fontweight='bold')
+        ax3.set_ylabel('Saturation (Flow/Capacity)', fontsize=12)
+        ax3.grid(axis='y', alpha=0.3)
+        
+        # 4. 算法性能雷达图
+        ax4 = axes[1, 1]
+        
+        # 计算各项指标（归一化到0-1）
+        # 假设：总出行时间越低越好，饱和度标准差越小越好，最高饱和度越小越好，收敛性越好
+        max_travel_time = max(travel_times)
+        normalized_travel_times = [1 - t/max_travel_time for t in travel_times]
+        
+        # 计算饱和度标准差
+        sat_stds = [np.std(sats) for sats in [aon_saturations, inc_saturations, fw_saturations]]
+        max_std = max(sat_stds)
+        normalized_stds = [1 - std/max_std for std in sat_stds]
+        
+        # 计算最高饱和度
+        max_sats = [max(sats) for sats in [aon_saturations, inc_saturations, fw_saturations]]
+        max_max_sat = max(max_sats)
+        normalized_max_sats = [1 - ms/max_max_sat for ms in max_sats]
+        
+        # 收敛性评分（假设）
+        convergence_scores = [0.3, 0.6, 0.9]  # All-or-Nothing不收敛，增量分配部分收敛，Frank-Wolfe收敛
+        
+        # 雷达图数据
+        categories = ['Travel Time', 'Saturation Std', 'Max Saturation', 'Convergence']
+        N = len(categories)
+        
+        angles = [n / float(N) * 2 * np.pi for n in range(N)]
+        angles += angles[:1]
+        
+        # 为每个算法绘制雷达图
+        for i, algorithm in enumerate(algorithms):
+            values = [normalized_travel_times[i], normalized_stds[i], 
+                     normalized_max_sats[i], convergence_scores[i]]
+            values += values[:1]
+            
+            ax4.plot(angles, values, 'o-', linewidth=2, label=algorithm)
+            ax4.fill(angles, values, alpha=0.25)
+        
+        ax4.set_xticks(angles[:-1])
+        ax4.set_xticklabels(categories)
+        ax4.set_ylim(0, 1)
+        ax4.set_title('Algorithm Performance Radar Chart', fontsize=14, fontweight='bold')
+        ax4.legend(loc='upper right')
+        ax4.grid(True)
+        
+        plt.suptitle('Traffic Assignment Algorithm Comparison', fontsize=18, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        print(f"算法比较图已保存到: {save_path}")
+    
+    def visualize_link_flow_distribution(self, results: Dict, algorithm_name: str, save_path: str = "./outputs/link_flow_distribution.png"):
+        """可视化路段流量分布"""
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+        
+        # 准备数据
+        links = sorted(self.links.keys())
+        flows = [self.links[link]['flow'] for link in links]
+        capacities = [self.links[link]['capacity'] for link in links]
+        saturations = [flow/cap if cap > 0 else 0 for flow, cap in zip(flows, capacities)]
+        
+        # 1. 路段流量柱状图
+        x = range(len(links))
+        width = 0.35
+        
+        bars1 = ax1.bar(x, flows, width, label='Assigned Flow', color='steelblue', alpha=0.8)
+        bars2 = ax1.bar([i + width for i in x], capacities, width, label='Capacity', color='lightcoral', alpha=0.6)
+        
+        ax1.set_xlabel('Links', fontsize=12)
+        ax1.set_ylabel('Flow/Capacity (veh/hr)', fontsize=12)
+        ax1.set_title(f'Link Flow Distribution - {algorithm_name}', fontsize=14, fontweight='bold')
+        ax1.set_xticks([i + width/2 for i in x])
+        ax1.set_xticklabels(links, rotation=45)
+        ax1.legend()
+        ax1.grid(axis='y', alpha=0.3)
+        
+        # 在柱子上添加流量数值
+        for bar in bars1:
+            height = bar.get_height()
+            if height > 0:
+                ax1.text(bar.get_x() + bar.get_width()/2., height + 20,
+                        f'{height:.0f}', ha='center', va='bottom', fontsize=9)
+        
+        # 2. 饱和度热力图
+        im = ax2.imshow([saturations], cmap='RdYlGn_r', aspect='auto', vmin=0, vmax=1.5)
+        
+        ax2.set_xticks(range(len(links)))
+        ax2.set_xticklabels(links, rotation=45)
+        ax2.set_yticks([0])
+        ax2.set_yticklabels(['Saturation'])
+        ax2.set_title('Link Saturation Heatmap', fontsize=14, fontweight='bold')
+        
+        # 添加颜色条
+        cbar = plt.colorbar(im, ax=ax2, orientation='vertical')
+        cbar.set_label('Saturation (Flow/Capacity)', fontsize=12)
+        
+        # 在热力图上添加数值
+        for i, sat in enumerate(saturations):
+            color = 'white' if sat > 0.7 else 'black'
+            ax2.text(i, 0, f'{sat:.2f}', ha='center', va='center', 
+                    color=color, fontweight='bold')
+        
+        plt.suptitle(f'Traffic Assignment Results - {algorithm_name}', fontsize=16, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        print(f"路段流量分布图已保存到: {save_path}")
+    
+    def visualize_convergence_history(self, convergence_history: List[Dict], save_path: str = "./outputs/convergence_history.png"):
+        """可视化Frank-Wolfe算法的收敛历史"""
+        if not convergence_history:
+            print("没有收敛历史数据")
+            return
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+        
+        iterations = [h['iteration'] for h in convergence_history]
+        relative_gaps = [h['relative_gap'] for h in convergence_history]
+        objectives = [h['objective'] for h in convergence_history]
+        travel_times = [h['travel_time'] for h in convergence_history]
+        
+        # 1. 相对对偶间隙收敛图
+        ax1.semilogy(iterations, relative_gaps, 'b-o', linewidth=2, markersize=8)
+        ax1.axhline(y=1e-3, color='r', linestyle='--', alpha=0.7, label='Convergence threshold (1e-3)')
+        ax1.set_xlabel('Iteration', fontsize=12)
+        ax1.set_ylabel('Relative Gap (log scale)', fontsize=12)
+        ax1.set_title('Frank-Wolfe Algorithm Convergence', fontsize=14, fontweight='bold')
+        ax1.grid(True, alpha=0.3)
+        ax1.legend()
+        
+        # 标记收敛点
+        for i, gap in enumerate(relative_gaps):
+            if gap < 1e-3:
+                ax1.plot(iterations[i], gap, 'ro', markersize=10, markeredgewidth=2, 
+                        markeredgecolor='black', label=f'Converged at iteration {iterations[i]}' if i == 0 else "")
+                break
+        
+        # 2. 目标函数和总出行时间变化图
+        ax2.plot(iterations, objectives, 'g-s', linewidth=2, markersize=8, label='Objective Function')
+        ax2.plot(iterations, travel_times, 'r-^', linewidth=2, markersize=8, label='Total Travel Time')
+        ax2.set_xlabel('Iteration', fontsize=12)
+        ax2.set_ylabel('Value', fontsize=12)
+        ax2.set_title('Objective Function and Travel Time Evolution', fontsize=14, fontweight='bold')
+        ax2.grid(True, alpha=0.3)
+        ax2.legend()
+        
+        # 添加数值标签
+        for i in [0, len(iterations)-1]:
+            ax2.text(iterations[i], objectives[i], f'{objectives[i]:.0f}', 
+                    ha='center', va='bottom', fontsize=10)
+            ax2.text(iterations[i], travel_times[i], f'{travel_times[i]:.0f}', 
+                    ha='center', va='top', fontsize=10)
+        
+        plt.suptitle('Frank-Wolfe Algorithm Performance Analysis', fontsize=16, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        print(f"收敛历史图已保存到: {save_path}")
+    
+    def visualize_od_demand_matrix(self, save_path: str = "./outputs/od_demand_matrix.png"):
+        """可视化OD需求矩阵"""
+        # 创建OD矩阵
+        nodes = sorted(self.nodes.keys())
+        od_matrix = np.zeros((len(nodes), len(nodes)))
+        
+        # 填充OD矩阵
+        node_index = {node: i for i, node in enumerate(nodes)}
+        for demand in self.demands:
+            i = node_index[demand['from']]
+            j = node_index[demand['to']]
+            od_matrix[i, j] = demand['amount']
+        
+        # 创建热力图
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        im = ax.imshow(od_matrix, cmap='YlOrRd', aspect='auto')
+        
+        # 设置刻度
+        ax.set_xticks(range(len(nodes)))
+        ax.set_yticks(range(len(nodes)))
+        ax.set_xticklabels(nodes)
+        ax.set_yticklabels(nodes)
+        
+        # 添加标题和标签
+        ax.set_title('Origin-Destination Demand Matrix', fontsize=16, fontweight='bold')
+        ax.set_xlabel('Destination', fontsize=12)
+        ax.set_ylabel('Origin', fontsize=12)
+        
+        # 添加颜色条
+        cbar = ax.figure.colorbar(im, ax=ax)
+        cbar.ax.set_ylabel('Demand (veh/hr)', rotation=90, va='bottom')
+        
+        # 在热力图上添加数值
+        for i in range(len(nodes)):
+            for j in range(len(nodes)):
+                if od_matrix[i, j] > 0:
+                    text = ax.text(j, i, f'{od_matrix[i, j]:.0f}',
+                                  ha="center", va="center", color="black", fontweight='bold')
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        print(f"OD需求矩阵图已保存到: {save_path}")
+    
+    def visualize_path_usage(self, results: Dict, algorithm_name: str, save_path: str = "./outputs/path_usage.png"):
+        """可视化路径使用情况"""
+        if not results.get('used_paths'):
+            print(f"{algorithm_name} 没有找到使用的路径")
+            return
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+        
+        # 准备数据
+        paths = list(results['used_paths'].keys())
+        flows = [results['used_paths'][p]['flow'] for p in paths]
+        travel_times = [results['used_paths'][p]['travel_time'] for p in paths]
+        
+        # 1. 路径流量饼图
+        ax1.pie(flows, labels=paths, autopct='%1.1f%%', startangle=90, 
+                colors=plt.cm.Set3(np.linspace(0, 1, len(paths))))
+        ax1.set_title(f'Path Flow Distribution - {algorithm_name}', fontsize=14, fontweight='bold')
+        ax1.axis('equal')  # Equal aspect ratio ensures that pie is drawn as a circle.
+        
+        # 2. 路径行程时间与流量关系图
+        scatter = ax2.scatter(travel_times, flows, s=[f/10 for f in flows], 
+                             alpha=0.7, c=travel_times, cmap='viridis', edgecolors='black')
+        
+        # 添加路径标签
+        for i, (path, flow, time) in enumerate(zip(paths, flows, travel_times)):
+            # 简化路径标签显示
+            simple_path = path.replace('->', '-')
+            ax2.annotate(simple_path, (time, flow), 
+                        xytext=(5, 5), textcoords='offset points',
+                        fontsize=9, alpha=0.8)
+        
+        ax2.set_xlabel('Travel Time (hours)', fontsize=12)
+        ax2.set_ylabel('Flow (veh/hr)', fontsize=12)
+        ax2.set_title('Path Travel Time vs Flow', fontsize=14, fontweight='bold')
+        ax2.grid(True, alpha=0.3)
+        
+        # 添加颜色条
+        cbar = plt.colorbar(scatter, ax=ax2)
+        cbar.set_label('Travel Time (hours)', fontsize=12)
+        
+        plt.suptitle(f'Path Usage Analysis - {algorithm_name}', fontsize=16, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        print(f"路径使用情况图已保存到: {save_path}")
+    
+    def compare_algorithms(self, aon_result: Dict, inc_result: Dict, fw_result: Dict):
+        """比较三种算法的结果"""
+        print(f"\n{'='*80}")
+        print("三种交通分配算法对比分析")
+        print(f"{'='*80}")
+        
+        print(f"\n算法性能对比:")
+        print(f"{'算法名称':<25} {'总出行时间(车辆-小时)':<25} {'计算复杂度':<15} {'收敛性':<10}")
+        print(f"{'-'*80}")
+        
+        algorithms = [
+            ("全有全无分配", aon_result['total_travel_time'], "低", "不收敛"),
+            ("增量分配", inc_result['total_travel_time'], "中", "部分收敛"), 
+            ("Frank-Wolfe均衡", fw_result['total_travel_time'], "高", "收敛")
+        ]
+        
+        for name, travel_time, complexity, convergence in algorithms:
+            print(f"{name:<25} {travel_time:<25.2f} {complexity:<15} {convergence:<10}")
+        
+        aon_time = aon_result['total_travel_time']
+        inc_time = inc_result['total_travel_time']
+        fw_time = fw_result['total_travel_time']
+        
+        print(f"\n效率提升分析:")
+        if aon_time > 0 and inc_time > 0:
+            improvement_inc = (aon_time - inc_time) / aon_time * 100
+            print(f"增量分配相比全有全无分配提升: {improvement_inc:.2f}%")
+        
+        if aon_time > 0 and fw_time > 0:
+            improvement_fw = (aon_time - fw_time) / aon_time * 100
+            print(f"Frank-Wolfe相比全有全无分配提升: {improvement_fw:.2f}%")
+        
+        if inc_time > 0 and fw_time > 0:
+            improvement = (inc_time - fw_time) / inc_time * 100
+            print(f"Frank-Wolfe相比增量分配提升: {improvement:.2f}%")
+            
+            if improvement < -2:  # 允许2%的误差
+                print("⚠️ 警告: Frank-Wolfe结果比增量分配差，可能存在收敛问题")
+            elif improvement > 0:
+                print("✅ Frank-Wolfe达到预期效果，优于增量分配")
+            else:
+                print("ℹ️ Frank-Wolfe与增量分配结果相近")
+
 
 # 使用示例
 if __name__ == "__main__":
     network = RoadNetwork()
     
     try:
-        # 加载路网和需求数据
         network.load_network("network.json")
         network.load_demand("demand.json")
         
-        # 文本可视化路网
         network.text_visualization()
         
-        # 执行全有全无分配
+        # 全有全无分配
         print("\n" + "="*60)
         print("开始执行全有全无分配")
         print("="*60)
+        
+        # 先执行单OD分配
+        network.print_single_od_results("全有全无分配")
+        
+        # 再执行整体分配
         aon_result = network.all_or_nothing_assignment()
         network.print_assignment_results(aon_result, "全有全无分配")
-        network.visualize_network(aon_result, "全有全无分配", "aon_assignment.png")
         
-        # 执行增量分配
+        # 增量分配
         print("\n" + "="*60)
         print("开始执行增量分配")
         print("="*60)
+        
+        # 先执行单OD分配
+        network.print_single_od_results("增量分配")
+        
+        # 再执行整体分配
         inc_result = network.incremental_assignment(increments=4)
         network.print_assignment_results(inc_result, "增量分配")
-        network.visualize_network(inc_result, "增量分配", "incremental_assignment.png")
         
-        # 执行Frank-Wolfe用户均衡分配
+        # Frank-Wolfe用户均衡分配
         print("\n" + "="*60)
         print("开始执行Frank-Wolfe用户均衡分配")
         print("="*60)
+        
+        # 先执行单OD分配
+        network.print_single_od_results("Frank-Wolfe用户均衡分配")
+        
+        # 再执行整体分配
         fw_result = network.frank_wolfe_equilibrium(max_iterations=50, tolerance=1e-3)
         network.print_assignment_results(fw_result, "Frank-Wolfe用户均衡分配")
-        network.visualize_network(fw_result, "Frank-Wolfe用户均衡分配", "frank_wolfe_assignment.png")
         
-        # 绘制收敛过程
-        if 'convergence_history' in fw_result:
-            network.plot_convergence(fw_result['convergence_history'], 
-                                   "Frank-Wolfe算法", 
-                                   "convergence_plot.png")
-        
-        # 绘制流量对比
-        aon_flows = {link_id: network.links[link_id]['flow'] for link_id in network.links}
-        # 重新获取增量分配和Frank-Wolfe的流量
-        network.incremental_assignment(increments=4)
-        inc_flows = {link_id: network.links[link_id]['flow'] for link_id in network.links}
-        network.frank_wolfe_equilibrium(max_iterations=50, tolerance=1e-3)
-        fw_flows = {link_id: network.links[link_id]['flow'] for link_id in network.links}
-        
-        network.plot_flow_comparison(aon_flows, inc_flows, fw_flows, "flow_comparison.png")
-        
-        # 比较三种算法
         network.compare_algorithms(aon_result, inc_result, fw_result)
+
+        # 可视化Frank-Wolfe分配结果
+        network.visualize_link_flow_distribution(fw_result, "Frank-Wolfe User Equilibrium")
+        network.visualize_path_usage(fw_result, "Frank-Wolfe User Equilibrium")
+        
+        # 可视化收敛历史
+        if 'convergence_history' in fw_result:
+            network.visualize_convergence_history(fw_result['convergence_history'])
+        
+        # 可视化网络结构
+        network.visualize_network_structure()
+        
+        # 算法比较
+        network.compare_algorithms(aon_result, inc_result, fw_result)
+        
+        # 可视化算法比较
+        network.visualize_algorithm_comparison(aon_result, inc_result, fw_result)
         
     except Exception as e:
         print(f"程序执行出错: {e}")
